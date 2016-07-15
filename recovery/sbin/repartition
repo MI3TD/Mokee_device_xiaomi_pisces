@@ -1,0 +1,378 @@
+#!/sbin/sh
+# vim:noet
+
+MMCBLK=${MMCBLK:-/dev/block/mmcblk0}
+DATA_PARTNAME=UDA
+DATA_PARTNUM=27
+STORAGE_PARTNAME=STO
+STORAGE_PARTNUM=28
+
+# MiB reserve due to parted alignment
+SHRINK_RESERVE_SIZE=8
+
+#
+# helper functions
+#
+
+lecho() {
+	case "$language" in
+	zh*) echo "$2";;
+	*) echo "$1";;
+	esac
+}
+
+ldie() {
+	local ret=$?
+	if [[ $ret = 0 ]]; then
+		ret=1
+	fi
+
+	>&2 \
+	lecho "repartition: Error: $1" \
+	      "repartition: 错误: $2"
+
+	exit $ret
+}
+
+ldiefailed() {
+	ldie "Failed: $@" \
+	     "失败: $@"
+}
+
+for cmd in \
+	awk \
+	grep \
+	printf \
+	sed \
+	sleep \
+;
+do
+	type "$cmd" &>/dev/null || alias $cmd="busybox $cmd"
+done
+
+if [[ -e /sbin/e2fsck-wrapper.sh ]]; then
+	alias e2fsck=/sbin/e2fsck-wrapper.sh
+fi
+alias
+
+#
+# utils
+#
+
+parted_print() {
+	parted -ms "${MMCBLK}" unit MiB print "$@" 2>&1 | sed 's/MiB//g; s/;$//g'
+}
+
+waitpath_gone() {
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		if [[ ! -e "$1" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+waitpath() {
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		if [[ -e "$1" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+get_data_blocksize() {
+	local blocksize=$(dumpe2fs -h "${MMCBLK}"p$DATA_PARTNUM 2>/dev/null | sed 's# \+##g' | awk 'BEGIN { FS=":"; } /Blocksize/ { print $2; } ')
+	if [[ -z $blocksize ]]; then
+		blocksize=4096
+	fi
+	echo "$blocksize"
+}
+
+resize_datafs() {
+	local tosize=$1
+	local blocksize=$(get_data_blocksize)
+	local devpath="${MMCBLK}p${DATA_PARTNUM}"
+
+	waitpath "$devpath" \
+	|| ldie "$devpath not found" \
+	        "找不到 $devpath"
+
+	e2fsck -fp "$devpath" || ldiefailed
+
+	if [[ -z $tosize ]]; then
+		resize2fs -p "$devpath" || ldiefailed
+	else
+		local blocks=$(echo "$tosize" "$blocksize" | awk '{ print $1 * 1024 * 1024 / $2; }')
+		resize2fs -p "$devpath" "$blocks" || ldiefailed
+	fi
+
+	e2fsck -p "$devpath" || ldiefailed
+}
+
+#
+# api
+#
+
+repartition_get_datastorage_size() {
+	parted_print free | { read; awk '
+			BEGIN {
+				totalsize = 0;
+				part26size = 0;
+				FS = ":";
+			}
+			{
+				if (!totalsize) {
+					totalsize = $2;
+					next;
+				}
+			}
+			/^26:.*/ {
+				part26size=$3
+				print totalsize - part26size
+			}
+		';
+	}
+}
+
+repartition_get_data_size() {
+	local data_size=$(parted_print | { read; awk '
+			BEGIN  { FS = ":"; }
+			/^'$DATA_PARTNUM':/ { print $4; }
+		'
+	})
+	if [[ -z $data_size ]]; then
+		data_size=0
+	fi
+	echo "$data_size"
+}
+
+repartition_get_data_minsize() {
+	local blocksize=$(get_data_blocksize)
+	umount "${MMCBLK}"p$DATA_PARTNUM &>/dev/null
+	local minblocks=$(resize2fs -P "${MMCBLK}"p$DATA_PARTNUM 2>/dev/null | sed 's#  \+# #g' | awk 'BEGIN { FS=":"; } /Estimated minimum size of the filesystem/ { print $2; } ')
+	if [[ -z $minblocks ]]; then
+		minblocks=0
+	fi
+	echo "$minblocks" "$blocksize" "$SHRINK_RESERVE_SIZE" | awk '{ print $1 * $2 / 1024 / 1024 + $3; }'
+}
+
+#
+# recovery commands
+#
+
+recovery_resize() {
+	recovery_loadsize
+
+	local datastorage_size=$partition_datastorage_size
+	local data_size=$partition_data_size
+	local data_minsize=$partition_data_minsize
+	if [[ -z $datastorage_size ]]; then
+		ldiefailed "detecting data+storage size" \
+		           "检测 data+storage 大小"
+	fi
+
+	local devpath
+
+	devpath="${MMCBLK}p${STORAGE_PARTNUM}"
+	if [[ -e $devpath ]]; then
+		umount /internal_sdcard &>/dev/null
+		mkdir -p /internal_sdcard
+		mount -t ext4 "$devpath" /internal_sdcard 2>/dev/null
+		if ls /internal_sdcard/* 2>/dev/null | grep . >/dev/null; then
+			umount /internal_sdcard &>/dev/null
+			ldiefailed "Old Internal Storage not empty, format it before continue" \
+			           "内部存储卡有数据, 请格式化 Old Internal Storage"
+		fi
+		umount /internal_sdcard &>/dev/null
+	fi
+
+	# umount
+	lecho "umount'ing all mounted ${MMCBLK} partitions" \
+	      "正在 umount 所有已挂载的 ${MMCBLK} 分区"
+	mount | grep ^${MMCBLK} | while read -r devpath b; do
+		umount "$devpath"
+	done
+	if mount | grep ^${MMCBLK}; then
+		ldiefailed "partitions above failed to mount" \
+		           "以上分区 umount 失败"
+	fi
+
+	local data_newsize=$1
+	if echo "$data_newsize" "$data_minsize" | awk '{ exit $1 < $2 ? 0 : 1; }'; then
+		ldie "Not allowed to resize data to less than minimal size $data_minsize" \
+		     "不允许将 data 调整到少于最小容量 $data_minsize"
+	fi
+
+	if echo "$data_newsize" "$datastorage_size" | awk '{ exit $1 > $2 ? 0 : 1; }'; then
+		ldie "Not allowed to resize data to more than maximal available space $datastorage_size" \
+		     "不允许将 data 调整到大于最大有效空间 $datastorage_size"
+	fi
+
+	local storage_newsize=$(echo "$data_newsize" "$datastorage_size" | awk '{
+		freesize = $2 - $1;
+		if (freesize < 64) {
+			freesize = 0;
+		}
+		print freesize;
+	}')
+
+	if [[ $storage_newsize = 0 ]]; then
+		data_newsize=$datastorage_size
+	fi
+
+	lecho "Available space: ${datastorage_size}MiB" \
+	      "有效空间: ${datastorage_size}MiB"
+
+	lecho "Planning size: data=${data_newsize}MiB storage=${storage_newsize}MiB" \
+	      "执行调整到: data=${data_newsize}MiB storage=${storage_newsize}MiB"
+
+	echo
+
+	local is_shrinking=0
+	if echo "$data_newsize" "$data_size" | awk '{ exit $1 < $2 ? 0 : 1; }'; then
+		is_shrinking=1
+	fi
+
+	local prevpartnum=$((DATA_PARTNUM-1))
+	local data_newbegin=$(
+		parted_print | { read; awk '
+				BEGIN  {
+					FS = ":";
+					prevend = 0;
+					databegin = 0;
+				}
+				/^'$prevpartnum':/ { prevend = $3; }
+				/^'$DATA_PARTNUM':/ { databegin = $2; }
+				END    { print databegin ? databegin : prevend; }
+			'
+		}
+	)
+
+	local data_newend=$(echo "$data_newbegin" "$data_newsize" | awk '{ print $1 + $2; }')
+
+	local parted_data_newbegin=${data_newbegin}MiB
+	local parted_data_newend
+	if [[ $storage_newsize = 0 ]]; then
+		parted_data_newend=100%
+	else
+		parted_data_newend=${data_newend}MiB
+	fi
+
+	if [[ $is_shrinking = 1 ]]; then
+		lecho "Shrinking data filesystem from ${data_size}MiB to ${data_newsize}MiB" \
+		      "正在将 data 文件系统 ($DATA_PARTNUM) 从 ${data_size}MiB 缩小到 ${data_newsize}MiB"
+		local data_shrinkto=$(echo "${data_newsize}" "$SHRINK_RESERVE_SIZE" | awk '{ print $1 - $2; }')
+		resize_datafs ${data_shrinkto} || ldiefailed
+	fi
+
+	lecho "Removing storage partition ($STORAGE_PARTNUM) if found" \
+	      "正在删除 storage 分区 ($STORAGE_PARTNUM) (如果存在)"
+	parted -ms "${MMCBLK}" rm "$STORAGE_PARTNUM" 2>/dev/null
+	rm -f "${MMCBLK}p${STORAGE_PARTNUM}"
+
+	lecho "Removing data partition ($DATA_PARTNUM) if found" \
+	      "正在删除 data 分区 ($DATA_PARTNUM) (如果存在)"
+	parted -ms "${MMCBLK}" rm "$DATA_PARTNUM" 2>/dev/null
+	rm -f "${MMCBLK}p${DATA_PARTNUM}"
+
+	lecho "Re-creating data partition ($DATA_PARTNUM): ${data_newsize}MiB" \
+	      "正在重建 data 分区 ($DATA_PARTNUM): ${data_newsize}MiB"
+	parted -ms "${MMCBLK}" \
+		mkpart "$DATA_PARTNAME" ${parted_data_newbegin} ${parted_data_newend} \
+		name "$DATA_PARTNUM" "$DATA_PARTNAME" \
+		|| ldiefailed
+
+	lecho "Resizing data filesystem to fill up whole partition" \
+	      "正在将 data 调整到充满整个分区"
+	resize_datafs || ldiefailed
+
+	local parted_storage_newbegin=$parted_data_newend
+	if [[ $parted_storage_newbegin = 100% ]]; then
+		lecho "No more free space left, skipped creating new storage partition ($STORAGE_PARTNUM)" \
+	        "空间已满, 略过/不创建 storage 分区 ($STORAGE_PARTNUM)"
+	else
+		lecho "Re-creating storage partition ($STORAGE_PARTNUM): ${storage_newsize}MiB" \
+	        "正在重建 storage 分区 ($STORAGE_PARTNUM): ${storage_newsize}MiB"
+		parted -ms "${MMCBLK}" \
+			mkpart "$STORAGE_PARTNAME" ext4 "$parted_storage_newbegin" 100% \
+			name "$STORAGE_PARTNUM" "$STORAGE_PARTNAME" \
+		|| ldiefailed
+
+		lecho "Re-creating storage filesystemB" \
+	        "正在重建 storage 文件系统"
+		local storagedevpath="${MMCBLK}p${STORAGE_PARTNUM}"
+		waitpath "$storagedevpath" || ldiefailed
+		sleep 1
+		mke2fs -F -t ext4 "$storagedevpath" || ldiefailed
+	fi
+
+	lecho "Current partition table (tail part):" \
+	      "现有分区布局 (尾部):"
+	parted -s "${MMCBLK}" \
+		unit MiB \
+		print free | tail -n4
+
+	lecho "Re-partition succeeded" \
+	      "分区调整成功"
+
+	echo
+
+	/sbin/dualboot -l load \
+	|| lecho "Partition table reload failed. Errors above can be ignored except that you must reboot recovery for your more operations" \
+	         "分区表刷新失败, 以上错误可以忽略, 但在您进行后续操作之前务必现在重启 Recovery"
+}
+
+recovery_loadsize() {
+	lecho "Loading partition size ..."\
+	      "正在载入分区大小 ..."
+	partition_datastorage_size=`repartition_get_datastorage_size`
+	setprop partition.datastorage_size $partition_datastorage_size
+
+	lecho "Loading data partition size ..." \
+	      "正在载入 data 分区大小 ..."
+	partition_data_size=`repartition_get_data_size`
+	setprop partition.data_size $partition_data_size
+
+	lecho "Checking data minimal size ..." \
+	      "正在检查 data 最小容量"
+	partition_data_minsize=`repartition_get_data_minsize`
+	setprop partition.data_minsize $partition_data_minsize
+}
+
+#
+# main
+#
+
+language=`getprop user.language`
+
+# log to recovery
+case "$1" in
+-ll)
+	shift
+	exec >>/tmp/recovery.log 2>&1
+	lecho "Executing $0 $@" \
+	     "正在执行 $0 $@"
+;;
+-l)
+	shift
+	exec 2>&1
+	lecho "Executing $0 $@" \
+	      "正在执行 $0 $@"
+;;
+esac
+
+
+command="$1"
+shift
+case "$command" in
+resize|loadsize)
+	recovery_$command "$@"
+;;
+*)
+	ldie "invoke by recovery only" \
+	     "仅用于 recovery"
+;;
+esac

@@ -1,0 +1,8 @@
+##########################
+# Devices
+/dev/imx132             u:object_r:camera_device:s0
+/dev/imx135             u:object_r:camera_device:s0
+#
+/storage(/.*)?		        u:object_r:app_data_file:s0
+/storage_int(/.*)?		u:object_r:app_data_file:s0
+#############################

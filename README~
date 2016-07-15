@@ -1,0 +1,10 @@
+Unofficial CM device tree for MI3TD(pisces)
+
+CM12(lollipop):
+	fixed:
+		nfc
+		bluetooth
+		audio
+		app to sd
+		vibrator
+		phone call
